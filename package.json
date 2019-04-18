@@ -1,0 +1,29 @@
+{
+  "name": "wxapp-thin",
+  "version": "1.0.0",
+  "description": "微信小程序瘦身（减小主包体积)",
+  "private": true,
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/juddy-star/wxapp-thin.git"
+  },
+  "scripts": {
+    "start": "node scripts/miniPackage/index.js"
+  },
+  "keywords": [
+    "wxapp",
+    "thin"
+  ],
+  "author": "juddy-star",
+  "email": "654312777@qq.com",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/juddy-star/wxapp-thin/issues"
+  },
+  "homepage": "https://github.com/juddy-star/wxapp-thin#readme",
+  "devDependencies": {
+    "chalk": "^2.4.2",
+    "table": "^5.2.3"
+  },
+  "dependencies": {}
+}
