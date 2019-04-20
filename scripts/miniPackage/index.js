@@ -179,6 +179,19 @@ const regularMatch = (ext = '', fileData) => {
 
 
 /**
+ * 是第三方包
+ *
+ * @param {string} [srcImport='']
+ * @param {string} [ext='']
+ * @returns
+ */
+const isNodeModules = (srcImport = '', ext = '') => {
+  if (!/(\.){0,2}\//.test(srcImport) && ext === 'js') console.log(srcImport);
+  // 不是以./ ../ / 开头  并且  是js
+  return !/(\.){0,2}\//.test(srcImport) && ext === 'js';
+}
+
+/**
  *处理文件所引用的文件
  *
  * @param {*} [key=[]]
@@ -197,7 +210,15 @@ const polyImportPathname = (fileInfo = {}) => {
     regularMatch(ext, fileData).forEach((srcImport) => {
       // 匹配到的文件路径（记得补充后缀）
       let srcDirname = path.resolve(directory, srcImport);
-      if (ext === 'js') srcDirname = `${srcDirname}.js`;
+      // 如果引入的是绝对路径
+      if (path.isAbsolute(srcImport)) {
+        srcDirname = path.resolve(process.cwd(), ROOT_PATH, srcImport.slice(1));
+      }
+      if (ext === 'js' && srcDirname.indexOf('.js') === -1) srcDirname = `${srcDirname}.js`; 
+      // 如果是第三方包, 源文件绝对路径跟srcImport保持一致
+      if (isNodeModules(srcImport, ext)) {
+        srcDirname = srcImport;
+      }
 
       // 判断是否是满足需求的import
       const key = IMPORT_CONF.find(key => srcDirname.indexOf(`${ROOT_PATH}/${key}/`) > -1);
@@ -411,13 +432,14 @@ const optimizeStatistics = ({ flatArray = [], dependencyCache = {}, packageCache
  *计算新的相对地址
  *
  * @param {*} srcDirname
- * @param {*} srcRelative
+ * @param {*} srcRelative  有可能是绝对路径
  * @param {*} distDirname
  * @returns
  */
 const relativePath = (srcDirname, srcRelative, distDirname) => {
   const srcDir = path.dirname(srcDirname);
-  const srcAbs = path.resolve(srcDir, srcRelative);
+  let srcAbs = path.resolve(srcDir, srcRelative);
+  if (path.isAbsolute(srcRelative)) srcAbs = path.resolve(process.cwd(), ROOT_PATH, srcRelative.slice(1));
   const distDir = path.dirname(distDirname);
   return path.relative(distDir, srcAbs);
 }
@@ -463,6 +485,8 @@ const executePathname = ({ flatArray = [], dependencyCache = {}, packageCache = 
           });
         if (!isPage) {
           regularMatch(ext, fileData).forEach((item) => {
+            // 如果是第三方包则不改变引用的路径
+            if (isNodeModules(item, ext)) return;
             // 如果不是分包依赖的文件，都需要重新定位路径
             if (!srcImports.some(srcImport => srcImport === item)) {
               const distItem = relativePath(dirname, item, distDirname);
