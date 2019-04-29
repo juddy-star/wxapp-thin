@@ -1,4 +1,4 @@
-# wxapp-gulp 微信小程序瘦身 （减小主包体积）
+# wxapp-thin 微信小程序瘦身 （减小主包体积）
 
 ## features
 
