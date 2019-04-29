@@ -22,7 +22,10 @@ npm start
 
 ```js
 miniPackage
+├── config.js
+├── error.js
 ├── index.js
+├── log.js
 └── utils.js
 
 src                  -----源文件
