@@ -1,61 +1,121 @@
-const fs = require('fs');
+/*eslint-disable global-require */
+/*eslint-disable import/no-dynamic-require */
+const blueBird = require('bluebird');
+const fs = blueBird.promisifyAll(require('fs'));
 const path = require('path');
 const chalk = require('chalk');
-const { table } = require('table');
+const Error = require('./error.js');
+const Log = require('./log.js');
 const {
   readFileAsync,
   writeFileAsync,
   unlinkAsync,
-  getAllFile
+  getAllFile,
 } = require('./utils.js');
 
-// 阈值
-const THRESHOLD = Infinity;
+const {
+  // 阈值
+  threshold: THRESHOLD,
+  // 根路径
+  root: ROOT_PATH,
+  // 运行node所在的目录
+  __cwd,
+  // 总包大小
+  totalSize: TOTAL_SIZE,
+  // 分包/主包大小
+  subSize: SUB_SIZE,
+  // 下发文件所在目录的白名单
+  whiteList,
+  // 下发文件所在目录的黑名单
+  blackList,
+  // 指定下发的分包
+  optSubPackage
+} = require('./config.js');
 
-// 总包大小
-const TOTAL_SIZE = 8 * 1024 * 1024;
+const log = new Log();
+const error = new Error();
 
-// 分包/主包大小
-const SUB_SIZE = 2 * 1024 * 1024;
-
-// 依赖文件的配置信息
-const IMPORT_CONF = ['components'];
-
-// 根路径
-const ROOT_PATH = 'dist';
-
-// 指定下发的分包
-const optSubPackage = [
-];
-
-// 运行node所在的目录
-const __cwd = process.cwd();
-
-// 不可删除的依赖文件
-const NO_UNLINK = [
-];
+/**
+ * resolve
+ * 
+ * 1. process.cwd()
+ * 2. dist目录下的绝对路径
+ *
+ * @param {*} rest
+ */
+const resolve = (...rest) => path.resolve.apply(path, [__cwd, ROOT_PATH, ...rest]);
 
 // 小程序配置文件
-const config = require('../../src/app.json');
+const config = require(resolve('app.json'));
 
 // 主包的文件
 const mainPackage = ((config) => {
   return config.pages.map((dirname) => {
-    return path.dirname(dirname);
+    return path.dirname(resolve(dirname));
   });
 })(config);
 
 // 分包的文件
 const subPackage = ((config) => {
-  return config.subPackages.map(item => item.root);
+  return config.subPackages.map(item => resolve(item.root));
 })(config);
+
+/**
+ * 拿到入口的文件列表
+ *
+ * @returns
+ */
+const getEntryFileList = () => {
+  const {
+    pages: mainPages = [], subPackages = []
+  } = config;
+
+  /**
+   * 通过入口文件（不带后缀），生成四种带后缀的文件
+   *
+   * @param {*} [fileDirList=[]]
+   * @param {string} [fileDirNoExt='']
+   * @returns
+   */
+  const genFileDirList = (fileDirList = [], fileDirNoExt = '') => {
+    const unitFileDirList = ['.wxml', '.js', '.wxss', '.json']
+      .map(ext => `${fileDirNoExt}${ext}`)
+      .filter(fileDir => fs.existsSync(fileDir));
+
+    return [...fileDirList, ...unitFileDirList];
+  }
+
+  const mainPageFileDirList = mainPages
+    .map(mainPage => resolve(mainPage))
+    .reduce(genFileDirList, []);
+
+  /**
+   * 生成分包的所有页面的四种后缀的文件
+   *
+   * @param {*} [sPFDirList=[]]
+   * @param {*} [subPackage={}]
+   * @returns
+   */
+  const genSPFDirList = (sPFDirList = [], subPackage = {}) => {
+    const { root: subPackageRoot = '', pages: subPackagePages = [] } = subPackage;
+
+    return subPackagePages
+      .map((subPackagePage) => resolve(subPackageRoot, subPackagePage))
+      .reduce(genFileDirList, sPFDirList);
+  };
+
+  const subPageFileDirList = subPackages.reduce(genSPFDirList, []);
+
+  return [...mainPageFileDirList, ...subPageFileDirList, resolve('app.wxss'), resolve('app.js')];
+  // return [resolve('pages/main/index.js'), resolve('pages/midShare/index.js')];
+};
 
 // 三种文件格式的import验证规则
 const regulars = {
-  wxml: /<import src=["']([\w./-]+)["']/gm,
-  wxss: /@import ["']([\w./-]+)["']/gm,
+  wxml: /<import src=["']([\w./-/$]+)["']/gm,
+  wxss: /@import ["']([\w./-/$]+)["']/gm,
   // 兼容es6和es5的语法，不支持AMD的格式
-  js: /(import \w+ from ["']([\w./-]+)["'])|(require\(["']([\w./-]+)["']\))/gm
+  js: /(import(?: .+ from)? ["']([\w./-/$]+)["'])|(require\(["']([\w./-/$]+)["']\))/gm
 };
 
 /**
@@ -127,18 +187,18 @@ const packagePathname = (flatArray = []) => {
   return flatArray.map(fileInfo => {
     const { dirname = '' } = fileInfo;
     if (!fileInfo.packages) fileInfo.packages = {};
-    const findPackage = [...mainPackage, ...subPackage].find(item => dirname.indexOf(item) > -1);
+    const findPackage = [...mainPackage, ...subPackage].find(item => dirname.indexOf(item + '/') > -1);
     if (findPackage) {
-      fileInfo.packages.directory = path.join(__cwd, ROOT_PATH, findPackage);
+      fileInfo.packages.directory = findPackage;
       fileInfo.packages.type = subPackage.some(item => item === findPackage) ? 'sub' : 'main';
     } else {
-      fileInfo.packages.directory = path.join(__cwd, ROOT_PATH);
+      fileInfo.packages.directory = resolve();
       fileInfo.packages.type = 'main';
     }
     // 判断该分包是否被允许接纳下发的依赖文件
     const { directory = '', type = '' } = fileInfo.packages;
     if (type === 'sub') {
-      fileInfo.packages.legalInto = optSubPackage.length === 0 || optSubPackage.some(path => directory.indexOf(path) > -1);
+      fileInfo.packages.legalInto = optSubPackage.length === 0 || optSubPackage.some(packageDir => directory === resolve(packageDir));
     }
     return fileInfo;
   });
@@ -153,20 +213,44 @@ const packagePathname = (flatArray = []) => {
  * @returns
  */
 const polyAllImportPathname = (flatArray = []) => {
-  const flatArrayWithImport = flatArray.map(fileInfo => polyImportPathname(fileInfo));
+  const flatArrayWithImport = flatArray.map(fileInfo => polyImportPathname(fileInfo, []));
   return Promise.all(flatArrayWithImport);
 };
 
+
 /**
- *匹配正则后筛选的$1数据
+ * .json的匹配
+ *
+ * @param {string} [dirname='']
+ * @returns
+ */
+const regularMatchByJson = (dirname = '') => {
+  const { usingComponents = {} } = require(dirname);
+
+  const componentKeys = Object.keys(usingComponents);
+  if (componentKeys.length === 0) return [];
+  
+  const genMathcedStrList = (matchedStrList = [], componentKey = '') => {
+    const matchedStr = usingComponents[componentKey];
+
+    return ['.wxml', '.js', '.wxss', '.json'].reduce((matchedStrList = [], ext = '') => [...matchedStrList, `${matchedStr}${ext}`], matchedStrList);
+  };
+
+  return componentKeys.reduce(genMathcedStrList, []);
+};
+
+/**
+ * .js .wxml .wxss的匹配
  *
  * @param {string} [ext='']
  * @param {*} fileData
  * @returns
  */
-const regularMatch = (ext = '', fileData) => {
+const regularMatchCommon = (ext = '', fileData) => {
   const regularMatch = [];
+
   let tempData = [];
+
   /*eslint-disable no-cond-assign*/
   while (tempData = regulars[ext].exec(fileData)) {
   /*eslint-enable no-cond-assign*/
@@ -175,6 +259,23 @@ const regularMatch = (ext = '', fileData) => {
     regularMatch.push(pushData);
   }
   return regularMatch;
+};
+
+/**
+ * 匹配正则后筛选的$1数据
+ *
+ * 1. .json的匹配
+ * 2. .js .wxml .wxss的匹配
+ * 
+ * @param {string} [ext='']
+ * @param {*} fileData
+ * @returns
+ */
+const regularMatch = (ext = '', dirname = '', fileData) => {
+  // 处理json格式，自定义组件格式
+  if (ext === 'json') return regularMatchByJson(dirname);
+
+  return regularMatchCommon(ext, fileData);
 }
 
 
@@ -186,82 +287,223 @@ const regularMatch = (ext = '', fileData) => {
  * @returns
  */
 const isNodeModules = (srcImport = '', ext = '') => {
-  if (!/(\.){0,2}\//.test(srcImport) && ext === 'js') console.log(srcImport);
   // 不是以./ ../ / 开头  并且  是js
   return !/(\.){0,2}\//.test(srcImport) && ext === 'js';
 }
+
+/*
+ * 1. 结构 key value的hash结构
+ * 1.1. key 是  fileDir
+ * 1.2. value 是 Map
+ * 1.2.1 keys为  dirname distDirname, ext, packages, imports
+ * 1.2.2 imports为List结构 每一项为 src dist 不保存dependency 
+ * 
+ * */
+const polyFileMapCache = {};
 
 /**
  *处理文件所引用的文件
  *
  * @param {*} [key=[]]
  * @param {*} [fileInfo={}]
+ * @param {*} [deepKeys={}]
  * @returns
  */
-const polyImportPathname = (fileInfo = {}) => {
+const polyImportPathname = (fileInfo = {}, deepKeys = []) => {
   const { dirname = '', distDirname = '', ext = '', packages = {} } = fileInfo;
+
   if (!distDirname) fileInfo.distDirname = dirname;
-  const directory = path.dirname(dirname);
-  if (!fileInfo.imports) fileInfo.imports = [];
 
-  // 可能会多次读取依赖文件，暂时不做优化（后期用缓存做依赖）
-  return readFileAsync(dirname).then((fileData) => {
-    const matchedImports = [];
-    regularMatch(ext, fileData).forEach((srcImport) => {
-      // 匹配到的文件路径（记得补充后缀）
-      let srcDirname = path.resolve(directory, srcImport);
-      // 如果引入的是绝对路径
-      if (path.isAbsolute(srcImport)) {
-        srcDirname = path.resolve(process.cwd(), ROOT_PATH, srcImport.slice(1));
-      }
-      if (ext === 'js' && srcDirname.indexOf('.js') === -1) srcDirname = `${srcDirname}.js`; 
-      // 如果是第三方包, 源文件绝对路径跟srcImport保持一致
-      if (isNodeModules(srcImport, ext)) {
-        srcDirname = srcImport;
-      }
-
-      // 判断是否是满足需求的import
-      const key = IMPORT_CONF.find(key => srcDirname.indexOf(`${ROOT_PATH}/${key}/`) > -1);
-      if (key) {
-        const imports = {
-          src: {
-            imports: srcImport,
-            dirname: srcDirname
-          }
-        };
-        // ROOT_PATH/IMPORT_CONF/
-        const realKey = `${ROOT_PATH}/${key}/`;
-        // key之后的路径
-        const relativeDirname = srcDirname.slice(srcDirname.indexOf(realKey) + realKey.length);
-        // 转移到该包下的路径
-        const distDirname = path.join(packages.directory, 'build', key, relativeDirname);
-        // 转移到该包下之后需要匹配的文本 （记得去掉后缀）
-        let distImport = path.relative(path.dirname(dirname), distDirname);
-        if (ext === 'js') distImport = distImport.slice(0, distImport.lastIndexOf('.'));
-        imports.dist = {
-          imports: distImport,
-          dirname: distDirname
-        };
-        fileInfo.imports.push(imports);
-
-        // 深度递归依赖树
-        matchedImports.push(polyImportPathname({
-          dirname: srcDirname,
-          distDirname,
-          ext: path.extname(srcDirname).slice(1),
-          packages
-        }));
-      }
-    });
+  /**
+   * 保存fileData
+   *
+   * @param {*} fileData
+   * @returns
+   */
+  const saveFileData = (fileData) => {
     fileInfo.fileData = fileData;
-    return Promise.all(matchedImports).then((importsArr = []) => {
-      let { imports = [] } = fileInfo;
-      imports.forEach((item, index) => {
-        item.dependency = importsArr[index];
-      })
-      return fileInfo;
-    });
-  });
+    return fileData;
+  };
+
+  /**
+   * 生成引入文件产生的imports数据结构
+   * 1. src:  imports dirname
+   * 2. dist: imports dirname
+   * 3. dependency: polyImportPathname(fileInfo)
+   *
+   */
+  const genMatchedImportsCommonList = (matchedStrList = []) => {
+    /**
+     * 生成匹配的文件的polyImport对象
+     *
+     * @param {string} [matchedStr='']
+     * @returns
+     */
+    const genMatchedImportsCommonMap = (matchedStr = '') => {
+      // 默认按照相对路径解析，拿到绝对路径（不确定是否有后缀）
+      let matchedFileDir = resolve(path.dirname(dirname), matchedStr);
+      // 如果是绝对路径, 按照绝对路径解析
+      if (path.isAbsolute(matchedStr)) matchedFileDir = resolve(matchedStr.slice(1));
+
+      // 如果是第三方包, 返回空Map
+      if (isNodeModules(matchedStr, ext)) return {};
+
+      // 解析路径
+      const parsedDirMap = path.parse(matchedFileDir);
+      // 如果没有后缀，把父层的后缀赋给当前路径
+      if (!parsedDirMap.ext) parsedDirMap.base += `.${ext}`;
+      // 生成完整的绝对路径
+      matchedFileDir = path.format(parsedDirMap);
+      // 不存在该文件，返回空Map
+      if (!fs.existsSync(matchedFileDir)) {
+        error.addFailDep({
+          fileDir: dirname,
+          matchedDir: matchedFileDir,
+          matchedStr 
+        });
+        return {};
+      }
+
+      // 文件下发后的路径
+      const distFileDir = resolve(packages.directory, 'build', matchedFileDir.replace(resolve(), '').slice(1));
+
+      let srcImports = matchedStr;
+      let distImports = path.relative(path.dirname(dirname), distFileDir);
+
+      // 如果当前是json文件，则依赖字符串去掉后缀
+      srcImports = ext === 'json' ? srcImports.replace(/\.\w+$/, '') : srcImports;
+      distImports = ext === 'json' ? distImports.replace(/\.\w+$/, '') : distImports;
+
+      // 准备工作完成，开始组装数据
+      return {
+        src: {
+          imports: srcImports,
+          dirname: matchedFileDir
+        },
+        dist: {
+          imports: distImports,
+          dirname: distFileDir,
+        },
+      };
+    };
+
+    /**
+     * 忽略异常文件
+     * 1. 不存在的文件
+     * 2. 第三方包
+     *
+     * @param {*} [matchedImportsMap={}]
+     */
+    const ignoreBlankMap = (matchedImportsMap = {}) => Object.keys(matchedImportsMap).length > 0;
+
+    return matchedStrList
+      .map(genMatchedImportsCommonMap)
+      .filter(ignoreBlankMap);
+  };
+
+  /**
+   * 添加到缓存
+   *
+   * @param {*} [imports=[]]
+   * @returns
+   */
+  const addToCache = (matchedStrList = []) => {
+    polyFileMapCache[dirname] = {
+      fileData: fileInfo.fileData,
+      matchedStrList
+
+    };
+    return matchedStrList;
+  }
+
+  /**
+   * 生成引入文件产生的imports数据结构
+   * 1. dependency: polyImportPathname(fileInfo)
+   *
+   * @param {*} [matchedImportsCommonList=[]]
+   * @returns
+   */
+  const genMatchedImportsDepListAsync = (matchedImportsCommonList = []) => {
+     /**
+     * 把polyImport对象递归化
+     *
+     * @param {*} [matchedImportsMap={}]
+     */
+    const genMatchedImportsDep = (matchedImportsMap = {}) => {
+      const { src: { dirname = '' } = {}, dist: { dirname: distDirname = '' } = {} } = matchedImportsMap;
+
+      return polyImportPathname({
+        dirname,
+        distDirname,
+        ext: path.extname(dirname).slice(1),
+        packages
+      }, [...deepKeys]);
+    }
+
+    const matchedImportsDepListAsync = matchedImportsCommonList.map(genMatchedImportsDep);
+
+    /**
+     * 组装数据结构
+     *
+     * @param {*} [depList=[]]
+     * @returns
+     */
+    const setupMatchedImportsList = (depList = []) => {
+      return depList.map((dep, index) => ({
+        ...matchedImportsCommonList[index],
+        dependency: dep
+      }));
+    }
+
+    return Promise.all(matchedImportsDepListAsync)
+      .then(setupMatchedImportsList);
+  };
+
+  /**
+   * 保存由引入文件生成的imports数据结构
+   * 
+   * 1. 依然返回当前的fileInfo
+   *
+   * @param {*} [matchedImportsList=[]]
+   * @returns
+   */
+  const saveMatchedImportsList = (matchedImportsList = []) => {
+    fileInfo.imports = matchedImportsList;
+
+    return fileInfo;
+  };
+
+  // deepKeys当中是否有当前的fileInfo，如果有的话，直接返回当前的fileInfo
+  if (deepKeys.some(deepKey => deepKey === dirname)) {
+    error.addCircleDep([...deepKeys, dirname]);
+    return fileInfo;
+  }
+
+  // deepKeys中保存当前的dirname
+  deepKeys.push(dirname);
+
+  const { [dirname]: polyFileCache = {} } = polyFileMapCache;
+
+  let regularAsync = Promise.resolve();
+
+  // 含有缓存，拿到缓存中的imports和fileData
+  if (Object.keys(polyFileCache).length > 0) {
+    const { matchedStrList = [], fileData } = polyFileCache;
+
+    fileInfo.fileData = fileData;
+
+    regularAsync = Promise.resolve(matchedStrList);
+  } else {
+    regularAsync = readFileAsync(dirname)
+    .then(saveFileData)
+    .then(regularMatch.bind(regularMatch, ext, dirname))
+    .then(addToCache)
+  }
+
+  return regularAsync
+    .then(genMatchedImportsCommonList)
+    .then(genMatchedImportsDepListAsync)
+    .then(saveMatchedImportsList)
 };
 
 /**
@@ -272,57 +514,94 @@ const polyImportPathname = (fileInfo = {}) => {
  * @param {*} [flatArray=[]]
  */
 const dependencyStatistics = (flatArray = [], dependencyCache = {}) => {
-  const depDependency = [];
-  // 统计被引入了多少次以及大小
-  flatArray.forEach((fileInfo) => {
+  /**
+   * 处理当前的imports
+   *
+   * @param {*} [fileInfo={}]
+   */
+  const genImportsList = (fileInfo = {}) => {
     const { imports = [], packages = {} } = fileInfo;
-    if (imports.length > 0) {
-      imports.forEach((item) => {
-        const { src = {}, dependency = {} } = item;
-        const { dirname = '' } = src;
-        // 被引入了多少次，以及大小
-        if (!dependencyCache[dirname]) {
-          const stat = fs.statSync(dirname);
-          dependencyCache[dirname] = {
-            usedCount: 1,
-            size: parseInt(stat.size, 10),
-            importByMain: false,
-            packages: []
-          };
-        } else {
-          dependencyCache[dirname].usedCount += 1;
-        }
-        // 依赖该文件的包的信息
-        if (!dependencyCache[dirname].packages.some(item => item.directory === packages.directory)) {
-          dependencyCache[dirname].packages.push(packages);
-        }
-        // 是否被主包引入过
-        const { [dirname]: { importByMain = false } = {} } = dependencyCache;
-        if (!importByMain && packages.type === 'main') dependencyCache[dirname].importByMain = true;
 
-        depDependency.push(dependency);
-      });
-    }
-  });
-  if (depDependency.length === 0) return { flatArray, dependencyCache };
+    /**
+     * 处理当前importsItem
+     *
+     * @param {*} [importsItem={}]
+     */
+    const genImports = (importsItem = {}) => {
+      const { src: { dirname = '' } = {} } = importsItem;
 
-  return Promise.resolve(dependencyStatistics(depDependency, dependencyCache))
-    .then(() => { return { flatArray, dependencyCache } });
+      if (!dependencyCache[dirname]) {
+        const stat = fs.statSync(dirname);
+        dependencyCache[dirname] = {
+          usedCount: 1,
+          size: parseInt(stat.size, 10),
+          importByMain: false,
+          packages: [],
+          analiedList: [],
+        }; 
+      } else {
+        dependencyCache[dirname].usedCount += 1;
+      }
+       // 依赖该文件的包的信息
+      if (!dependencyCache[dirname].packages.some(item => item.directory === packages.directory)) {
+        dependencyCache[dirname].packages.push(packages);
+      }
+      // 是否被主包引入过
+      const { [dirname]: { importByMain = false } = {} } = dependencyCache;
+      if (!importByMain && packages.type === 'main') dependencyCache[dirname].importByMain = true;
+    };
+
+    imports.forEach(genImports);
+  }
+
+  /**
+   * 获得当前层的所有dependency(fileInfo)
+   *
+   * @param {*} [dependencyList=[]]
+   * @param {*} [fileInfo={}]
+   * @returns
+   */
+  const genDependencyList = (dependencyList = [], fileInfo = {}) => {
+    const { imports = [] } = fileInfo;
+
+    /**
+     * 拿到当前ImportsItem的dependency
+     *
+     * @param {*} [dependencyList=[]]
+     * @param {*} [importsItem={}]
+     * @returns
+     */
+    const genDepListFromImports = (dependencyList = [], importsItem = {}) => {
+      const { dependency = {} } = importsItem;
+
+      dependencyList.push(dependency);
+
+      return dependencyList;
+    };
+
+    return imports.reduce(genDepListFromImports, dependencyList);
+  };
+
+  // 如果没有数据，直接返回
+  if (flatArray.length === 0) return Promise.resolve({ flatArray, dependencyCache });
+
+  // 先处理当前层的依赖
+  flatArray.forEach(genImportsList);
+
+  // 再处理递归依赖
+  const dependencyList = flatArray.reduce(genDependencyList, []);
+  dependencyStatistics(dependencyList, dependencyCache);
+
+  // 最后返回处理后的数据
+  return Promise.resolve({ flatArray, dependencyCache });
 }
 
 /**
- *对依赖的文件进行二次处理
+ * 是否是在主包或者分包目录下的文件
  *
- * @param {*} [{ flatArray = [], dependencyCache = {} }={}]
- * @returns
+ * @param {*} dirname
  */
-const depDependencyStatistics = ({ flatArray = [], dependencyCache = {} } = {}) => {
-  NO_UNLINK.forEach((key) => {
-    if (dependencyCache[key]) dependencyCache[key].importByMain = true;
-  });
-  return { flatArray, dependencyCache };
-}
-
+const isFileDirFromPackage = dirname => [...mainPackage, ...subPackage].some(catalogDir => dirname.indexOf(`${catalogDir}/`) > -1);
 
 /**
  *统计包的信息
@@ -330,41 +609,101 @@ const depDependencyStatistics = ({ flatArray = [], dependencyCache = {} } = {}) 
  * @param {*} [{ flatArray = [], dependencyCache = {} }={}]
  */
 const packageStatistics = ({ flatArray = [], dependencyCache = {} } = {}) => {
-  let packageCache = {};
-  const totalDir = path.resolve(__cwd, `./${ROOT_PATH}`);
-  const totalSize = directorysSize([totalDir]).then(size => { return { total: { size, optSize: size } } });
-  let subSize = subPackage.map((item) => {
-    const subItemDir = path.join(__cwd, ROOT_PATH, item);
-    return directorysSize([subItemDir]).then(size => { return { directory: subItemDir, size, optSize: size }; });
-  });
+  const totalDir = resolve();
 
-  subSize = Promise.all(subSize).then((itemsSize = []) => {
-    const size = itemsSize.reduce((total, item) => total + item.size, 0);
-    const dependency = {};
-    itemsSize.forEach((item = {}) => {
+  const totalSize = directorysSize([totalDir]).then(size => ({ total: { size, optSize: size } }));
+
+  const subSizeList = subPackage.map((item) => directorysSize([item]).then(size => ({ directory: item, size, optSize: size })));
+
+  /**
+   * 生成分包大小
+   *
+   * @param {*} [itemsSize=[]]
+   * @returns
+   */
+  const genSubSize = (itemsSize = []) => {
+    const subTotalSize = itemsSize.reduce((total, item) => total + item.size, 0);
+
+    /**
+     * 生成总分包的依赖
+     *
+     * @param {*} [dependency={}]
+     * @param {*} [item={}]
+     * @returns
+     */
+    const genDependencyMap = (dependencyMap = {}, item = {}) => {
       const { directory = '', size = 0, optSize = 0 } = item;
-      dependency[directory] = {
-        size,
-        optSize
-      };
-    });
-    return { sub: {
-      size,
-      optSize: size,
-      dependency
-    } };
-  });
+      dependencyMap[directory] = { size, optSize };
 
-  return Promise.all([totalSize, subSize]).then(([totalSize, subSize] = []) => {
-    packageCache = { ...packageCache, ...totalSize, ...subSize };
+      return dependencyMap;
+    };
+
+    const dependencyMap = itemsSize.reduce(genDependencyMap, {});
+
+    return { 
+      sub: {
+        size: subTotalSize,
+        optSize: subTotalSize,
+        dependency: dependencyMap
+      } 
+    };
+  };
+
+  const subSize = Promise.all(subSizeList).then(genSubSize);
+
+  /**
+   * 生成包信息
+   *
+   * @param {*} [[totalSize = {}, subSize = {}]=[]]
+   * @returns
+   */
+  const genPackageSize = ([totalSize = {}, subSize = {}] = []) => {
+    const packageCache = { ...totalSize, ...subSize };
     const { total, sub } = packageCache;
+
     packageCache.main = {
       size: total.size - sub.size,
       optSize: total.size - sub.size
     };
+
     return { flatArray, dependencyCache, packageCache };
-  });
+  };
+
+  return Promise.all([totalSize, subSize])
+    .then(genPackageSize);
 };
+
+/**
+ * 满足黑白名单
+ *
+ * @param {string} [dirname='']
+ * @returns
+ */
+const legalWhiteBlackFilter = (dirname = '') => {
+  const isLegalWhite = whiteList.length === 0 || whiteList.some(whiteStr => dirname.indexOf(`${resolve(whiteStr)}/`) > -1);
+  const isLegalBlack = blackList.length === 0 || blackList.every(blackStr => dirname.indexOf(`${resolve(blackStr)}/`) === -1);
+  return isLegalWhite && isLegalBlack;
+};
+
+/**
+ * 需要被下发的文件
+ * 1. 不是包文件
+ * 2. 该依赖文件没有被主包引入过
+ * 3. 不大于最大引入次数
+ * 4. 满足黑白名单
+ * 5. 所属的包都是指定分包
+ *
+ * @param {*} [dirname={}]
+ */
+const isFileDirAndNE = (dirname = '', dependencyCache = {}) => {
+    // 如果是包文件，不需要下发
+  if (isFileDirFromPackage(dirname)) return false;
+
+  const { importByMain = false, usedCount = 1, packages = [] } = dependencyCache[dirname];
+
+  // 依赖文件没有被主包引入过并且不大于最大引入次数 黑白名单的过滤
+  return !importByMain && usedCount <= THRESHOLD && legalWhiteBlackFilter(dirname) && packages.every(packageItem => packageItem.legalInto);
+}
 
 /**
  *
@@ -375,137 +714,240 @@ const packageStatistics = ({ flatArray = [], dependencyCache = {} } = {}) => {
  */
 const optimizeStatistics = ({ flatArray = [], dependencyCache = {}, packageCache = {} } = {}) => {
   const { total = {}, main = {}, sub = {} } = packageCache;
-  const catchErr = [];
+
+  /**
+   * 生成主包减小的大小
+   *
+   * @param {number} [total=0]
+   * @param {*} [key={}]
+   * @returns
+   */
+  const genLessSize = (total = 0, key = {}) => {
+    const { size = 0 } = dependencyCache[key];
+    // 该文件可被下发
+    if (isFileDirAndNE(key, dependencyCache)) return total + size;
+    return total;
+  };
 
   // 统计主包优化后的大小
-  const lessSize = Object.keys(dependencyCache).reduce((total = 0, key = {}) => {
-    const item = dependencyCache[key];
-    const { size = 0, importByMain = false, usedCount = 1, packages = [] } = item;
-    // 依赖文件从主包移除的条件
-    if (!importByMain && usedCount <= THRESHOLD && packages.every(packageItem => packageItem.legalInto)) {
-      return total + size;
-    }
-    return total;
-  }, 0);
+  const lessSize = Object.keys(dependencyCache).reduce(genLessSize, 0);
+
   const { size: mainSize = 0 } = main;
   main.optSize = mainSize - lessSize;
 
   if (main.optSize > SUB_SIZE) {
-    // catchErr.push({ type: 'MAXSize', msg: `主包大小超过${SUB_SIZE}` });
+    error.addOptimizeError({
+      packageDir: '主包',
+      size: main.optSize,
+      maxSize: SUB_SIZE
+    });
   }
 
-  // 统计分包优化后的每个分包大小
-  Object.keys(dependencyCache).forEach((key = '') => {
+  /**
+   * 生成每个分包优化后大小
+   *
+   * @param {string} [key='']
+   */
+  const genSubDepOptSize = (key = '') => {
     const data = dependencyCache[key];
-    const { importByMain = false, usedCount = 1, size: dependencySize = 0, packages = [] } = data;
-    if (!importByMain && usedCount <= THRESHOLD) {
-      packages.forEach(({ directory = '', type = '', legalInto = true } = {}) => {
-        if (type === 'sub' && legalInto) {
-          sub.dependency[directory].optSize += dependencySize;
-        }
-      });
-    }
-  });
+    const { size = 0, packages = [] } = data;
 
-  // 统计分包优化后的总分包的大小
-  sub.optSize = Object.keys(sub.dependency).reduce((total, key) => {
+    // 该文件可被下发
+    if (isFileDirAndNE(key, dependencyCache)) {
+      /**
+       * 每个分包优化后的大小(跟该依赖文件有关的分包)
+       *
+       * @param {*} [{ directory = '', type = '', legalInto = true }={}]
+       */
+      const genDepOptSize = ({ directory = '' } = {}) => {
+        sub.dependency[directory].optSize += size;
+      };
+
+      packages.forEach(genDepOptSize);
+    }
+  };
+
+  // 统计每个分包优化后的每个分包大小
+  Object.keys(dependencyCache).forEach(genSubDepOptSize);
+
+  /**
+   * 生成总分包优化后的大小
+   *
+   * @param {*} total
+   * @param {*} key
+   * @returns
+   */
+  const genAllSubOptSize = (total, key) => {
     const data = sub.dependency[key];
     if (data.optSize > SUB_SIZE) {
-      // catchErr.push({ type: 'MAXSize', msg: `${key}大小超过${SUB_SIZE}` });
+      error.addOptimizeError({
+        packageDir: key,
+        size: data.optSize,
+        maxSize: SUB_SIZE
+      });
     }
     return total + data.optSize;
-  }, 0);
+  };
+
+  // 统计分包优化后的总分包的大小
+  sub.optSize = Object.keys(sub.dependency).reduce(genAllSubOptSize, 0);
 
   // 统计总优化后的大小
   total.optSize = main.optSize + sub.optSize;
 
   if (total.optSize > TOTAL_SIZE) {
-    // catchErr.push({ type: 'MAXSIZE', msg: `总包大小超过${TOTAL_SIZE}` });
-  }
-  if (catchErr.length > 0) {
-    return Promise.reject(catchErr);
+    error.addOptimizeError({
+      packageDir: '总包',
+      size: total.optSize,
+      maxSize: TOTAL_SIZE
+    });
   }
   return { flatArray, dependencyCache, packageCache };
 }
 
-/**
- *计算新的相对地址
- *
- * @param {*} srcDirname
- * @param {*} srcRelative  有可能是绝对路径
- * @param {*} distDirname
- * @returns
- */
-const relativePath = (srcDirname, srcRelative, distDirname) => {
-  const srcDir = path.dirname(srcDirname);
-  let srcAbs = path.resolve(srcDir, srcRelative);
-  if (path.isAbsolute(srcRelative)) srcAbs = path.resolve(process.cwd(), ROOT_PATH, srcRelative.slice(1));
-  const distDir = path.dirname(distDirname);
-  return path.relative(distDir, srcAbs);
-}
 
 /**
- *开始下发依赖的文件到分包里面
+ * 开始下发依赖的文件到分包里面
  *
  * @param {*} [{ flatArray = [], dependencyCache = {}, packageCache = {} }={}]
  */
 const executePathname = ({ flatArray = [], dependencyCache = {}, packageCache = {} } = {}) => {
-  const addPathname = [];
-  const executeDependency = [];
-  flatArray
-    // 是分包并且是指定的可以接受依赖文件的分包
-    .filter((item) => {
-      const { type, legalInto } = item.packages;
-      return type === 'sub' && legalInto;
-    })
-    .forEach((item) => {
-      const { dirname = '', distDirname = '', ext = '', fileData, imports = [] } = item;
+  /**
+   * 依赖文件没有被该包处理过
+   *
+   * @param {*} [fileInfo={}]
+   */
+  const isFileDirNotEexcuted = (fileInfo = {}) => {
+    const { dirname = '', packages: { directory = '' } = {} } = fileInfo;
+    const { analiedList = [] } = dependencyCache[dirname];
 
-      // 判断当前的是页面文件还是依赖文件
-      const isPage = !IMPORT_CONF.some(conf => dirname.indexOf(path.join(__cwd, ROOT_PATH, conf)) > -1);
+    if (analiedList.every(analiedFileDir => analiedFileDir !== directory)) {
+      analiedList.push(directory);
+      return true;
+    }
 
-      // 如果是页面文件，或者依赖文件还未打入分包中
-      if (isPage || !fs.existsSync(distDirname)) {
-        let distFileData = fileData;
-        // 满足下发条件的依赖文件
-        const srcImports = imports
-          .filter((item) => {
-            const { src: { dirname = '' } = {} } = item;
-            const { importByMain = false, usedCount = 1 } = dependencyCache[dirname];
-            return !importByMain && usedCount <= THRESHOLD;
-          })
-          .map((importData) => {
-            const { src = {}, dist = {}, dependency = {} } = importData;
-            // 如果是页面文件
-            if (isPage) distFileData = distFileData.replace(src.imports, dist.imports);
+    return false;
+  };
 
-            executeDependency.push(dependency);
+  const legalFlatList = flatArray
+    // 该文件所在的是合法分包（是分包并且是指定的可以接受依赖文件的分包）
+    .filter(({ packages: { type = '', legalInto = true } = {} } = {}) => type === 'sub' && legalInto)
+    // 是包文件(具体是入口文件，入口文件只会被处理一次)或 或者 文件没有被该包处理过
+    .filter((fileInfo = {}) => isFileDirFromPackage(fileInfo.dirname) || isFileDirNotEexcuted(fileInfo))
+    // 必须包含fileData
+    .filter((fileInfo = {}) => fileInfo.fileData);
 
-            return src.imports;
-          });
-        if (!isPage) {
-          regularMatch(ext, fileData).forEach((item) => {
-            // 如果是第三方包则不改变引用的路径
-            if (isNodeModules(item, ext)) return;
-            // 如果不是分包依赖的文件，都需要重新定位路径
-            if (!srcImports.some(srcImport => srcImport === item)) {
-              const distItem = relativePath(dirname, item, distDirname);
-              distFileData = distFileData.replace(item, distItem);
-            }
-          });
-        }
-        addPathname.push(writeFileAsync(distDirname, distFileData));
+  /**
+   * 拿到该文件的目的路径以及计算后的相对依赖
+   * 
+   * 1. 重新计算相对路径
+   * 2. 把相对路径有改变的文件写入相应的目的路径
+   * 
+   */
+  const genExecuteFileList = (executeFileList = [], fileInfo = {}) => {
+    const { imports = [], fileData, dirname = '', distDirname: fileDistDirname = '', ext = '' } = fileInfo; 
+    // 是否需要下发
+    const needExecuteFromFile = isFileDirAndNE(dirname, dependencyCache);
+
+    let distFileData = fileData;
+
+    /**
+     * 把新的相对地址写入文件
+     * 1. 是否改变过相对地址
+     * 2. 把新的相对地址写入文件
+     * 
+     * 当前文件与依赖文件都被下发，则相对路径不变
+     * 当前文件路径不变，依赖文件路径不变，则相对路径不变
+     * 当前文件路径不变，依赖文件路径改变 或者  当前路径改变，依赖文件路径不变，则相对路径改变
+     *
+     * @param {*} [importsItem={}]
+     */
+    const genRelativeDir = (importsItem = {}) => {
+      const { 
+        src: { imports: srcImports = '', dirname: srcDirname = '' } = {}, 
+        dist: { dirname: distDirname = '' } = {} } = importsItem;
+      const needExecuteFromImports = isFileDirAndNE(srcDirname, dependencyCache);
+
+      let relativeImports = srcImports;
+
+      // 当前文件路径改变，依赖文件路径不变
+      if (needExecuteFromFile && !needExecuteFromImports) {
+        relativeImports = path.relative(path.dirname(fileDistDirname), srcDirname);
       }
-    });
+      // 当前路径不变，依赖文件路径改变
+      else if (!needExecuteFromFile && needExecuteFromImports) {
+        relativeImports = path.relative(path.dirname(dirname), distDirname);
+      }
 
-  const promiseAllData = [...addPathname];
-  if (executeDependency.length !== 0) {
-    promiseAllData.push(executePathname({ flatArray: executeDependency, dependencyCache, packageCache }));
+      if ((needExecuteFromFile && !needExecuteFromImports) || (!needExecuteFromFile && needExecuteFromImports)) {
+        // 如果是json文件 则需要把依赖字符串的后缀去掉
+        if (ext === 'json') relativeImports = relativeImports.replace(/\.\w+$/, '');
+        distFileData = distFileData.replace(srcImports, relativeImports);
+      }
+    };
+
+    // 计算相对路径
+    imports.forEach(genRelativeDir);
+
+    executeFileList.push({ distDirname: needExecuteFromFile ? fileDistDirname : dirname, distFileData });
+
+    return executeFileList;
+  };
+
+  /**
+   * 把新的文件内容写入目的地址
+   *
+   * @param {*} [executeFile={}]
+   * @returns
+   */
+  const genWriteFile = (executeFile = {}) => {
+    const { distDirname = '', distFileData } = executeFile;
+
+    return writeFileAsync(distDirname, distFileData);
   }
 
-  return Promise.all(promiseAllData).then(() => { return { flatArray, dependencyCache, packageCache } });
-}
+  // 如果合法的文件列表为空，直接返回
+  if (legalFlatList.length === 0) return Promise.resolve({ flatArray, dependencyCache, packageCache });
 
+  const writeFileListAsync = legalFlatList
+    .reduce(genExecuteFileList, [])
+    .map(genWriteFile);
+
+  /**
+   * 生成所有文件的依赖List
+   *
+   * @param {*} [depFileList=[]]
+   * @param {*} [fileInfo={}]
+   * @returns
+   */
+  const genDepFileList = (depFileList = [], fileInfo = {}) => {
+    /**
+     * 从imports中找到所有的dependency
+     *
+     * @param {*} [depFileList=[]]
+     * @param {*} [importsItem={}]
+     * @returns
+     */
+    const genDepFileListFromImports = (depFileList = [], importsItem = {}) => {
+      const { dependency = {} } = importsItem;
+
+      depFileList.push(dependency);
+
+      return depFileList;
+    };   
+
+    return fileInfo.imports.reduce(genDepFileListFromImports, depFileList);
+  };
+
+  // 拿到下一层文件信息
+  const depFileList = legalFlatList.reduce(genDepFileList, [])
+
+
+  // 递归进行优化
+  const depExecutePathnameAsync = executePathname({ flatArray: depFileList, dependencyCache, packageCache });
+  // 返回入参
+  return Promise.all([writeFileListAsync, depExecutePathnameAsync]).then(() => ({ flatArray, dependencyCache, packageCache }));
+}
 
 /**
  *删除下发到分包中的依赖文件
@@ -515,28 +957,12 @@ const executePathname = ({ flatArray = [], dependencyCache = {}, packageCache = 
  */
 const unlinkPathname = ({ flatArray = [], dependencyCache = {}, packageCache = {} } = {}) => {
   const unlinkPromise = Object.keys(dependencyCache)
-    .filter((key) => {
-      const { importByMain = false, usedCount = 1, packages = [] } = dependencyCache[key];
-      // 依赖文件从主包移除的条件
-      return (!importByMain && usedCount <= THRESHOLD && packages.every(packageItem => packageItem.legalInto));
-    })
+    // 该文件可被下发
+    .filter((key) => isFileDirAndNE(key, dependencyCache))
     .map(key => unlinkAsync(key));
 
-  return Promise.all(unlinkPromise).then(() => { return { flatArray, dependencyCache, packageCache }; });
+  return Promise.all(unlinkPromise).then(() => ({ flatArray, dependencyCache, packageCache }));
 }
-
-const optSizeDisplay = (str = '') => {
-  let output = '';
-  const formatStr = String(str);
-  if (formatStr.length > 6) {
-    output = `${(Number(formatStr) / 1000000).toFixed(2)}MB`;
-  } else if (formatStr.length > 3) {
-    output = `${(Number(formatStr) / 1000).toFixed(2)}KB`;
-  } else {
-    output = `${formatStr}B`;
-  }
-  return chalk.blue(output);
-};
 
 /**
  *成功log
@@ -544,33 +970,10 @@ const optSizeDisplay = (str = '') => {
  * @param {*} [{ flatArray, dependencyCache, packageCache }={}]
  * @returns
  */
-const sucLog = ({ flatArray = [], dependencyCache = {}, packageCache = {} } = {}) => {
-  /*eslint-enable no-unused-vars */
-  console.log(chalk.magenta('分包优化成功\n'));
-  console.log(chalk.magenta('优化概况：'));
-  const { total, main, sub } = packageCache;
-  const packageCacheTable = table([
-    ['包类型', '瘦身前', '瘦身后'],
-    ['总包', optSizeDisplay(total.size), optSizeDisplay(total.optSize)],
-    ['主包', optSizeDisplay(main.size), optSizeDisplay(main.optSize)],
-    ['总分包', optSizeDisplay(sub.size), optSizeDisplay(sub.optSize)]
-  ]);
-  console.log(packageCacheTable, '\n');
+const sucLog = (dataMap = {}) => {
+  log.sucLog(dataMap);
 
-  // 每个分包的信息
-  console.log(chalk.magenta('优化详情：'));
-  const subTableData = Object.keys(sub.dependency).map((key) => {
-    const relativePath = path.relative(__cwd, key);
-    const { size = 0, optSize = 0 } = sub.dependency[key];
-    return { relativePath, size, optSize, changeSize: optSize - size };
-  }).sort((a, b) => {
-    return b.changeSize - a.changeSize;
-  }).map((item) => {
-    const { relativePath = '', size = 0, optSize = 0, changeSize = 0 } = item;
-    return [relativePath, optSizeDisplay(size), optSizeDisplay(optSize), optSizeDisplay(changeSize)];
-  });
-  console.log(table([['分包地址', '瘦身前', '瘦身后', '增量'], ...subTableData]));
-  return { flatArray, dependencyCache, packageCache };
+  return dataMap;
 };
 
 /**
@@ -578,27 +981,47 @@ const sucLog = ({ flatArray = [], dependencyCache = {}, packageCache = {} } = {}
  *
  * @param {*} [err={}]
  */
-const errLog = (err = {}) => {
-  /*eslint-enable no-unused-vars */
-  console.log(err);
+const errLog = () => {
+  console.log(chalk.red('请先处理以上异常，并重新执行gulp build'));
 };
 
+/**
+ * 分析文件依赖的错误信息
+ *
+ * @param {*} [dataMap={}]
+ * @returns
+ */
+const analysisError = (dataMap = {}) => {
+  if (!error.hasErrMsg()) return dataMap;
 
-// 读取文件的起始地址
-const filePath = path.join(__cwd, ROOT_PATH);
-// 排除的读取目录
-const importsPath = IMPORT_CONF.map(item => path.join(__cwd, ROOT_PATH, item));
+  // 展示循环依赖数据
+  error.showCircleDepList();
+  // 展示依赖失败数据
+  error.showNExistsList();
+
+  return Promise.reject();
+};
+
+const optimizeError = (dataMap = {}) => {
+  if (!error.hasOptimizeError()) return dataMap;
+
+  // 展示优化过程中的错误信息
+  error.showOptimizeError();
+
+  return Promise.reject();
+};
 
 // ROOT_PATH下的所有文件
-getAllFile(filePath, importsPath)
+Promise.resolve(getEntryFileList())
   .then(flatPathname)
   .then(extPathname)
   .then(packagePathname)
   .then(polyAllImportPathname)
   .then(dependencyStatistics)
-  .then(depDependencyStatistics)
+  .then(analysisError)
   .then(packageStatistics)
   .then(optimizeStatistics)
+  .then(optimizeError)
   .then(executePathname)
   .then(unlinkPathname)
   .then(sucLog)
