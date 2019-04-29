@@ -28,7 +28,7 @@ miniPackage
 ├── log.js
 └── utils.js
 
-src                  -----源文件
+dist                 -----打包后的目录
 ├── app.json         -----小程序json文件
 ├── components       -----小程序compoents文件夹（例如存放公共template）
 └── pages            -----小程序页面
