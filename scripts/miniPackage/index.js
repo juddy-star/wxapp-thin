@@ -878,8 +878,14 @@ const executePathname = ({ flatArray = [], dependencyCache = {}, packageCache = 
       else if (!needExecuteFromFile && needExecuteFromImports) {
         relativeImports = path.relative(path.dirname(dirname), distDirname);
       }
+      // 二者改变，但是依赖的路径是绝对路径, 要变为相对路径
+      else if (needExecuteFromFile && needExecuteFromImports && path.isAbsolute(srcImports)) {
+        relativeImports = path.relative(path.dirname(fileDistDirname), distDirname);
+      }
 
-      if ((needExecuteFromFile && !needExecuteFromImports) || (!needExecuteFromFile && needExecuteFromImports)) {
+      if ((needExecuteFromFile && !needExecuteFromImports) 
+       || (!needExecuteFromFile && needExecuteFromImports)
+       || (needExecuteFromFile && needExecuteFromImports && path.isAbsolute(srcImports))) {
         // 如果是json文件 则需要把依赖字符串的后缀去掉
         if (ext === 'json') relativeImports = relativeImports.replace(/\.\w+$/, '');
         distFileData = distFileData.replace(srcImports, relativeImports);
