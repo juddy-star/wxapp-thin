@@ -892,8 +892,24 @@ const executePathname = ({ flatArray = [], dependencyCache = {}, packageCache = 
       }
     };
 
+    /**
+     * 如果文件的后缀是json，那么只考虑后缀为json的依赖文件
+     *
+     * @param {*} importsItem
+     * @returns
+     */
+    const fitleExtByJson = (importsItem) => {
+      if (ext !== 'json') return true;
+
+      const { src: { dirname: srcDirname = '' } = {} } = importsItem;
+
+      if (/\.json$/.test(srcDirname)) return true;
+      return false;
+    };
+
     // 计算相对路径
-    imports.forEach(genRelativeDir);
+    imports.filter(fitleExtByJson)
+      .forEach(genRelativeDir);
 
     executeFileList.push({ distDirname: needExecuteFromFile ? fileDistDirname : dirname, distFileData });
 
